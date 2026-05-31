@@ -75,6 +75,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -150,11 +151,21 @@ fun NowPlayingScreen(
             insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             insetsController.hide(WindowInsetsCompat.Type.systemBars())
             
+            // Adjust icon color based on background luminance
+            val isDarkBackground = androidx.core.graphics.ColorUtils.calculateLuminance(uiState.dominantColor.toArgb()) < 0.5
+            insetsController.isAppearanceLightStatusBars = !isDarkBackground
+            insetsController.isAppearanceLightNavigationBars = !isDarkBackground
+            
             originalStatusBarColor = window.statusBarColor
             originalNavBarColor = window.navigationBarColor
             
             window.statusBarColor = android.graphics.Color.TRANSPARENT
             window.navigationBarColor = android.graphics.Color.TRANSPARENT
+            
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+                window.isStatusBarContrastEnforced = false
+            }
         }
 
         onDispose {
@@ -164,6 +175,10 @@ fun NowPlayingScreen(
                 insetsController.show(WindowInsetsCompat.Type.systemBars())
                 window.statusBarColor = originalStatusBarColor
                 window.navigationBarColor = originalNavBarColor
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    window.isNavigationBarContrastEnforced = true
+                    window.isStatusBarContrastEnforced = true
+                }
             }
         }
     }
@@ -290,20 +305,7 @@ fun NowPlayingScreen(
     val bottomPadding = innerPadding.calculateBottomPadding()
 
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .layout { measurable, constraints ->
-                val topPx = topPadding.roundToPx()
-                val bottomPx = bottomPadding.roundToPx()
-                val placeable = measurable.measure(
-                    constraints.copy(
-                        maxHeight = if (constraints.hasBoundedHeight) constraints.maxHeight + topPx + bottomPx else constraints.maxHeight
-                    )
-                )
-                layout(placeable.width, placeable.height) {
-                    placeable.place(0, -topPx)
-                }
-            }
+        modifier = Modifier.fillMaxSize()
     ) {
         // Ambient animated background behind everything.
         AmbientBackground(
@@ -317,13 +319,7 @@ fun NowPlayingScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(horizontal = 32.dp, vertical = 8.dp)
-                .layout { measurable, constraints ->
-                    val topPx = topPadding.roundToPx()
-                    val placeable = measurable.measure(constraints)
-                    layout(placeable.width, placeable.height) {
-                        placeable.place(0, topPx) // Push content down so it doesn't overlap camera hole
-                    }
-                },
+                .padding(top = topPadding),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             // -- Minimal header: "Now Playing" + queue subtitle --

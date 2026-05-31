@@ -127,13 +127,29 @@ fun StashScaffold(
             }
         },
     ) { innerPadding ->
+        val isNowPlayingOpen = currentRoute == NowPlayingRoute::class.qualifiedName
+        val animatedBottom by androidx.compose.animation.core.animateDpAsState(
+            targetValue = if (isNowPlayingOpen) 0.dp else innerPadding.calculateBottomPadding(),
+            animationSpec = androidx.compose.animation.core.tween(350),
+            label = "navHostBottomPadding"
+        )
+        val animatedTop by androidx.compose.animation.core.animateDpAsState(
+            targetValue = if (isNowPlayingOpen) 0.dp else innerPadding.calculateTopPadding(),
+            animationSpec = androidx.compose.animation.core.tween(350),
+            label = "navHostTopPadding"
+        )
+        val animatedPadding = androidx.compose.foundation.layout.PaddingValues(
+            top = animatedTop,
+            bottom = animatedBottom
+        )
+
         androidx.compose.runtime.CompositionLocalProvider(com.stash.core.ui.LocalScaffoldPadding provides innerPadding) {
             StashNavHost(
                 navController = navController,
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(innerPadding)
-                    .consumeWindowInsets(innerPadding),
+                    .padding(animatedPadding)
+                    .consumeWindowInsets(animatedPadding),
             )
         }
     }
