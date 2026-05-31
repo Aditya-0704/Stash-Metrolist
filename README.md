@@ -74,8 +74,8 @@ It keeps Stash's offline/online Android music stack (Spotify + YouTube Music syn
 ### Option 3 — Build from source
 
 ```bash
-git clone https://github.com/rawnaldclark/Stash.git
-cd Stash
+git clone https://github.com/Aditya-0704/Stash-Metrolist.git
+cd Stash-Metrolist
 ./gradlew assembleDebug
 # APK lands in app/build/outputs/apk/debug/
 ```
