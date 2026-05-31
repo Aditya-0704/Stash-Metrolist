@@ -1,18 +1,23 @@
-# Stash
+# Stash MetroList
 
-> **Your Spotify + YouTube Music library, in FLAC for free.**
+> **A MetroList-inspired UI refresh of Stash by Rawnald — your Spotify + YouTube Music library, in FLAC for free.**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-purple.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Android%208.0%2B-purple)](#requirements)
-[![Release](https://img.shields.io/github/v/release/rawnaldclark/Stash?color=purple&include_prereleases)](https://github.com/rawnaldclark/Stash/releases)
+[![Release](https://img.shields.io/github/v/release/Aditya-0704/Stash-Metrolist?color=purple&include_prereleases)](https://github.com/Aditya-0704/Stash-Metrolist/releases)
 
-Stash is an offline/online Android music player that syncs your liked songs, playlists, daily mixes, and discover mixes from both **Spotify** and **YouTube Music** into a single unified local library. Tracks are downloaded or streamed as high-quality FLAC audio.
+Stash MetroList is a UI-refresh fork of the original **[Stash](https://github.com/rawnaldclark/Stash)** project by **Rawnald Clark**.
+
+It keeps Stash's offline/online Android music stack (Spotify + YouTube Music sync, local library, and FLAC playback), while introducing a cleaner, glassmorphic MetroList visual style across core surfaces like Home and Now Playing.
  
 
 ---
 
 ## Features
 
+- **MetroList UI refresh** — redesigned Home and Now Playing with layered glass surfaces, richer gradients, and cleaner visual hierarchy
+- **Smoother full-screen player polish** — improved spacing and immersive playback presentation
+- **Modernized visual language** — refined typography, spacing, and icon rhythm while preserving familiar Stash workflows
 - **Offline everything** — tracks download as high-quality lossless audio
 - **Bulletproof matching** — finds the right version of tracks 99% of the time
 - **Custom playlists** — create your own playlists and save tracks to them from anywhere.
@@ -30,9 +35,11 @@ Stash is an offline/online Android music player that syncs your liked songs, pla
 ## Screenshots
 
 <p align="center">
-  <img src="docs/screenshots/home.png" width="280" alt="Home screen with tip jar, sync stats, and Daily Mixes">
-  <img src="docs/screenshots/now-playing.png" width="280" alt="Now playing — FLAC 24/44 lossless playback">
+  <img src="docs/screenshots/home.png" width="280" alt="MetroList home screen with refreshed cards, gradients, and sync surfaces">
+  <img src="docs/screenshots/now-playing.png" width="280" alt="MetroList now playing with immersive full-screen art and polished controls">
 </p>
+
+> These screenshots reflect the new MetroList-style UI direction in this fork.
 
 ---
 
@@ -49,8 +56,8 @@ Stash is an offline/online Android music player that syncs your liked songs, pla
 
 ### Option 1 — Download the APK (recommended)
 
-1. Open **[the Releases page](https://github.com/rawnaldclark/Stash/releases)** on your Android device's browser.
-2. Download the latest `Stash-v*.apk` file.
+1. Open **[the Releases page](https://github.com/Aditya-0704/Stash-Metrolist/releases)** on your Android device's browser.
+2. Download the latest APK file.
 3. Open the downloaded file.
 4. If Android warns you about "installing from unknown sources," tap **Settings** and allow it for your browser, then try opening the file again.
 5. Tap **Install** when prompted.
@@ -61,7 +68,7 @@ Stash is an offline/online Android music player that syncs your liked songs, pla
 [Obtainium](https://obtainium.imranr.dev/) is a free app that tracks GitHub Releases and notifies you when a new version is out. If you don't want to manually re-download APKs each release:
 
 1. Install Obtainium.
-2. Tap **Add App** and paste `https://github.com/rawnaldclark/Stash`.
+2. Tap **Add App** and paste `https://github.com/Aditya-0704/Stash-Metrolist`.
 3. Obtainium will now prompt you to update whenever a new Stash release ships.
 
 ### Option 3 — Build from source
