@@ -1,0 +1,815 @@
+package com.stash.feature.nowplaying
+
+import android.content.Context
+import android.graphics.Bitmap
+import androidx.compose.ui.graphics.Color
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.palette.graphics.Palette
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
+import androidx.work.WorkManager
+import androidx.work.workDataOf
+import com.stash.core.data.lossless.LosslessUpgrader
+import com.stash.core.data.repository.MusicRepository
+import com.stash.core.media.PlayerRepository
+import com.stash.core.model.UpgradeResult
+import com.stash.core.model.isFlac
+import com.stash.core.ui.components.PlaylistInfo
+import com.stash.core.model.Track
+import com.stash.core.ui.theme.PlayerColorExtractor
+import com.stash.data.lyrics.LyricsRepository
+import com.stash.data.lyrics.source.LyricsQuery
+import com.stash.data.lyrics.worker.LyricsFetchWorker
+import com.stash.feature.nowplaying.ui.LyricsViewState
+import com.stash.feature.nowplaying.ui.lyricsViewStateFor
+import com.stash.feature.nowplaying.ui.lyricsViewStateForResult
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import javax.inject.Inject
+
+/**
+ * ViewModel for the full-screen Now Playing screen.
+ *
+ * Observes [PlayerRepository.playerState] and [PlayerRepository.currentPosition],
+ * maps them into a single [NowPlayingUiState], and exposes one-shot action functions
+ * that delegate to the repository.
+ */
+@HiltViewModel
+class NowPlayingViewModel @Inject constructor(
+    private val playerRepository: PlayerRepository,
+    private val musicRepository: MusicRepository,
+    private val stashLikedRepository: com.stash.core.data.social.stash.StashLikedPlaylistRepository,
+    private val losslessUpgrader: LosslessUpgrader,
+    // v0.9.36 Task 12 — lyrics sheet observes the lyrics row and may
+    // enqueue a priority on-open fetch. WorkManager is sourced via
+    // `WorkManager.getInstance(appContext)` to match the rest of the
+    // codebase (see LyricsBackfillScheduler for the same shape — it's
+    // not Hilt-injectable in this project).
+    private val lyricsRepository: LyricsRepository,
+    @ApplicationContext private val appContext: Context,
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(NowPlayingUiState())
+    val uiState: StateFlow<NowPlayingUiState> = _uiState.asStateFlow()
+
+    private val _userMessages = MutableSharedFlow<String>(
+        // v0.9.18: bumped from 1 → 8. The Find-in-FLAC action emits TWO
+        // messages back-to-back ("Looking for FLAC…" → result), and a
+        // capacity-of-1 + DROP_OLDEST race meant the first message could
+        // get dropped before the Toast collector drained it (especially
+        // on fast-fail paths like a known-bad captcha cookie + circuit-
+        // broken kennyy, where both emits land within microseconds).
+        // Existing single-emit actions (flag, delete) are unaffected by
+        // the larger capacity.
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    /** One-shot snackbar messages (e.g. "Track flagged as wrong match"). */
+    val userMessages: SharedFlow<String> = _userMessages.asSharedFlow()
+
+    /**
+     * v0.9.27: holds optimistic heart-toggle states to prevent flickering.
+     */
+    private val optimisticLikeState = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
+
+    // ------------------------------------------------------------------
+    // v0.9.36 Task 12 — Lyrics sheet state
+    // ------------------------------------------------------------------
+
+    /**
+     * Whether the lyrics sheet is currently open. Toggled by
+     * [onShowLyrics] / [onDismissLyrics]; the Compose layer collects
+     * this and conditionally renders [com.stash.feature.nowplaying.ui.LyricsBottomSheet].
+     */
+    private val _lyricsSheetOpen = MutableStateFlow(false)
+    val lyricsSheetOpen: StateFlow<Boolean> = _lyricsSheetOpen.asStateFlow()
+
+    /**
+     * Transient lyrics state for streaming-mode tracks (id == 0L), which
+     * don't have a persistent `tracks` row to observe. Populated by
+     * [fetchStreamingLyrics] on sheet open; cleared (set to null) when
+     * the playing track changes so a stale render from the previous
+     * streamed song doesn't bleed through. Null = "not fetched yet";
+     * downstream [lyricsViewState] maps that to Loading.
+     */
+    private val _streamingLyricsState = MutableStateFlow<LyricsViewState?>(null)
+
+    /**
+     * Re-derives [LyricsViewState] from the currently-playing track and
+     * the observed [com.stash.core.data.db.entity.LyricsEntity] row.
+     *
+     * Tracks the `currentTrack` field of [uiState] (the same field the
+     * rest of Now Playing reads) so the sheet always reflects the
+     * track that's currently displayed/playing — no separate "selected
+     * for lyrics" state. When the track flips, [flatMapLatest] cancels
+     * the old observer and subscribes to the new track's row.
+     *
+     * SharingStarted.WhileSubscribed(5_000) keeps the flow warm for
+     * 5 seconds after the sheet closes so a quick close+reopen doesn't
+     * re-derive from scratch.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val lyricsViewState: StateFlow<LyricsViewState> = uiState
+        .map { it.currentTrack }
+        // Streaming-mode tracks all share id==0L; distinguish them by youtubeId so
+        // a track change between two streamed Yeat songs still flips the upstream.
+        .distinctUntilChanged { old, new -> trackKey(old) == trackKey(new) }
+        .onEach { _streamingLyricsState.value = null }   // reset transient state on track change
+        .flatMapLatest { track ->
+            when {
+                track == null -> flowOf(LyricsViewState.None)
+                track.id > 0L -> lyricsRepository.observe(track.id).map { row ->
+                    lyricsViewStateFor(track, row)
+                }
+                // Streaming track (id == 0L). The transient flow is seeded by
+                // onShowLyrics -> fetchStreamingLyrics. Until then, null means
+                // we haven't tried — render Loading.
+                else -> _streamingLyricsState.map { it ?: LyricsViewState.Loading }
+            }
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000L),
+            initialValue = LyricsViewState.Loading,
+        )
+
+    /**
+     * Stable key for a Track regardless of whether it's library-resident
+     * (positive `id`) or streaming-only (`id == 0L`). Mirrors the
+     * convention already used at [observePlayerStateLive] for the
+     * optimistic-like-state map. Returns null only when [track] is null.
+     */
+    private fun trackKey(track: Track?): Long? = when {
+        track == null -> null
+        track.id > 0L -> track.id
+        else -> track.youtubeId.hashCode().toLong()
+    }
+
+    /**
+     * Polls [PlayerRepository.currentPosition] at the existing 250ms
+     * cadence — same flow the [observePlayerStateLive] combine already
+     * consumes, so the player only ticks once.
+     *
+     * Exposed as a dedicated StateFlow so the lyrics sheet doesn't have
+     * to subscribe to the full [uiState] (which re-emits on every
+     * heart toggle, every queue change, every album-art recolor). The
+     * synced renderer only cares about the position, so this is the
+     * narrower subscription that matches what it needs.
+     */
+    val currentPositionMs: StateFlow<Long> = playerRepository.currentPosition
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000L),
+            initialValue = 0L,
+        )
+
+    init {
+        observePlayerStateLive()
+        observeUserPlaylists()
+        observeStreamingHaltedEvents()
+        observePlayerUserMessages()
+    }
+
+    // ------------------------------------------------------------------
+    // Observation
+    // ------------------------------------------------------------------
+
+    /**
+     * v0.9.13: Combines player-only fields (position, isPlaying, queue) with
+     * the canonical Track row from Room.
+     *
+     * The previous version of this used `state.currentTrack` directly, but
+     * `PlayerRepositoryImpl.toTrack()` reconstructs Track from MediaItem
+     * extras and only populates 5 fields out of ~25 — every other field
+     * (filePath, fileFormat, bitsPerSample, like timestamps, etc.) defaults
+     * to the data class default and is silently wrong. That's why every
+     * track displayed "OPUS" for the codec and why the heart icon failed
+     * to persist across Now Playing close+reopen — Now Playing was reading
+     * from MediaItem-derived junk, not the database.
+     *
+     * Now: take the id from the player (canonical "what's playing"),
+     * `flatMapLatest` into Room for the full row. Fall back to the
+     * player's snapshot only when Room has no row (e.g., streamed/preview
+     * content with synthetic id) so search-tab playback still works.
+     *
+     * v0.9.27 (fix): merges [optimisticLikeState] so the heart icon doesn't
+     * flicker when the 250ms position ticks race with the DB write.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun observePlayerStateLive() {
+        val liveTrackFlow = playerRepository.playerState
+            .map { it.currentTrack?.let { t -> t.id to t.youtubeId } }
+            .distinctUntilChanged()
+            .flatMapLatest { key ->
+                if (key == null) flowOf<com.stash.core.model.Track?>(null)
+                else {
+                    val (id, ytId) = key
+                    // Falls back to a youtube_id lookup so the heart icon
+                    // (and other Room-driven fields) update for v0.9.30
+                    // streaming-engine tracks whose `id` is a synthetic
+                    // `videoId.hashCode().toLong()` that doesn't exist in
+                    // `tracks` until `ensureTrackPersisted` writes one
+                    // under a real autogen PK (issue #105 follow-up).
+                    musicRepository.observeTrackById(id).flatMapLatest { row ->
+                        if (row != null || ytId.isNullOrBlank()) flowOf(row)
+                        else musicRepository.observeTrackByYoutubeId(ytId)
+                    }
+                }
+            }
+
+        combine(
+            playerRepository.playerState,
+            playerRepository.currentPosition,
+            liveTrackFlow,
+            optimisticLikeState,
+        ) { state, positionMs, liveTrack, optimistic ->
+            _uiState.update { current ->
+                val baseTrack = liveTrack ?: state.currentTrack
+                // When the player is streaming, the Room row's format fields
+                // are stale or default ("opus") — the row was synced without
+                // actually downloading the audio, so it has no real codec/bit
+                // depth/sample rate. The active MediaItem carries the Qobuz-
+                // reported format in its extras; overlay those onto the
+                // displayed Track so Now Playing shows the right badge.
+                val streamFormat = state.currentTrack
+                val track = if (
+                    state.isStreaming &&
+                    baseTrack != null &&
+                    streamFormat != null &&
+                    // ids diverge once `ensureTrackPersisted` writes a real
+                    // Room row for a streaming-engine synthetic id, so match
+                    // on youtube_id as a fallback to keep the codec badge alive.
+                    (streamFormat.id == baseTrack.id ||
+                        (!streamFormat.youtubeId.isNullOrBlank() &&
+                            streamFormat.youtubeId == baseTrack.youtubeId)) &&
+                    streamFormat.fileFormat.isNotBlank() &&
+                    streamFormat.fileFormat != "opus"
+                ) {
+                    baseTrack.copy(
+                        fileFormat = streamFormat.fileFormat,
+                        bitsPerSample = streamFormat.bitsPerSample ?: baseTrack.bitsPerSample,
+                        sampleRateHz = streamFormat.sampleRateHz ?: baseTrack.sampleRateHz,
+                        qualityKbps = if (streamFormat.qualityKbps > 0) streamFormat.qualityKbps else baseTrack.qualityKbps,
+                        // streamOrigin only exists on MediaItem-derived tracks (not in
+                        // Room), so always overlay from the active item when streaming.
+                        streamOrigin = streamFormat.streamOrigin,
+                    )
+                } else baseTrack
+                // ExoPlayer always knows the real duration once the
+                // stream loads; the Track-domain durationMs may still be
+                // 0 for streaming-engine tracks whose search-result
+                // metadata didn't carry one. Prefer the player's truth
+                // so `ensureTrackPersisted` writes the right value when
+                // the user likes/downloads the currently-playing track
+                // (issue #105 follow-up: stream-only Liked Songs were
+                // landing with 0:00 duration).
+                val durationOverlaid = track?.let {
+                    if (it.durationMs <= 0L && state.durationMs > 0L) it.copy(durationMs = state.durationMs)
+                    else it
+                }
+                val trackKey = if (durationOverlaid?.id == 0L) durationOverlaid.youtubeId.hashCode().toLong() else durationOverlaid?.id
+                val finalTrack = if (durationOverlaid != null && trackKey != null && optimistic.containsKey(trackKey)) {
+                    val optLiked = optimistic[trackKey]!!
+                    durationOverlaid.copy(stashLikedAt = if (optLiked) System.currentTimeMillis() else null)
+                } else {
+                    durationOverlaid
+                }
+
+                current.copy(
+                    // Prefer Room's live row; fall back to player's MediaItem
+                    // snapshot for non-library content (streams, search previews).
+                    currentTrack = finalTrack,
+                    isPlaying = state.isPlaying,
+                    currentPositionMs = positionMs,
+                    durationMs = state.durationMs,
+                    shuffleEnabled = state.isShuffleEnabled,
+                    repeatMode = state.repeatMode,
+                    queueSize = state.queue.size,
+                    currentIndex = state.currentIndex,
+                    queue = state.queue,
+                    isStreaming = state.isStreaming,
+                )
+            }
+        }.launchIn(viewModelScope)
+    }
+
+    /**
+     * Observes the "Save to Playlist" picker destination list — custom
+     * playlists AND imported Spotify / YT Music playlists.
+     * v0.9.23 (issue #42): manual addition of Stash-downloaded tracks
+     * to imported playlists is now supported. The new locally_added
+     * flag on the cross-ref makes the addition survive REFRESH-mode
+     * re-sync of the underlying Spotify / YT Music playlist.
+     */
+    private fun observeUserPlaylists() {
+        musicRepository.getPickablePlaylists()
+            .onEach { playlists ->
+                _uiState.update { current ->
+                    current.copy(
+                        userPlaylists = playlists.map { playlist ->
+                            PlaylistInfo(
+                                id = playlist.id,
+                                name = playlist.name,
+                                trackCount = playlist.trackCount,
+                            )
+                        },
+                    )
+                }
+            }
+            .launchIn(viewModelScope)
+    }
+
+    /**
+     * Subscribes to [PlayerRepository.streamingHaltedEvents] and surfaces
+     * each halt as a Toast via [_userMessages]. The cascade-guard in
+     * PlayerRepositoryImpl already paused the player by the time this
+     * fires — the Toast is purely informational so the user understands
+     * why playback stopped.
+     *
+     * Toast (not Snackbar) matches the existing NowPlayingScreen
+     * convention — see the comment near the `userMessages` collector in
+     * NowPlayingScreen.kt for why we don't wrap this screen in a
+     * Scaffold.
+     */
+    private fun observeStreamingHaltedEvents() {
+        playerRepository.streamingHaltedEvents
+            .onEach {
+                _userMessages.emit(
+                    "Streaming is failing \u2014 try a downloaded track or check your connection"
+                )
+            }
+            .launchIn(viewModelScope)
+    }
+
+    /**
+     * Forwards [PlayerRepository.userMessages] emissions into the screen's
+     * Toast channel. Source examples:
+     *  - "Couldn't play this track right now." (setQueue tap failure)
+     *  - "End of offline Mix" (v0.9.37 auto-advance silent-skip exhausted
+     *    the queue while offline)
+     * The player layer already paused playback when relevant; this
+     * observer is purely informational.
+     */
+    private fun observePlayerUserMessages() {
+        playerRepository.userMessages
+            .onEach { msg -> _userMessages.emit(msg) }
+            .launchIn(viewModelScope)
+    }
+
+    // observeLikeStateForCurrentTrack removed in v0.9.13 — subsumed by
+    // observePlayerStateLive's Room-bound currentTrack flow above.
+
+    // ------------------------------------------------------------------
+    // User Actions
+    // ------------------------------------------------------------------
+
+    /** Toggle between play and pause. */
+    fun onPlayPauseClick() {
+        viewModelScope.launch {
+            if (_uiState.value.isPlaying) {
+                playerRepository.pause()
+            } else {
+                playerRepository.play()
+            }
+        }
+    }
+
+    /** Advance to the next track in the queue. */
+    fun onSkipNext() {
+        viewModelScope.launch { playerRepository.skipNext() }
+    }
+
+    /** Return to the previous track (or restart current). */
+    fun onSkipPrevious() {
+        viewModelScope.launch { playerRepository.skipPrevious() }
+    }
+
+    /**
+     * Seek to [positionMs] within the current track.
+     *
+     * @param positionMs target position in milliseconds, clamped to `[0, durationMs]`.
+     */
+    fun onSeekTo(positionMs: Long) {
+        val clamped = positionMs.coerceIn(0L, _uiState.value.durationMs)
+        viewModelScope.launch { playerRepository.seekTo(clamped) }
+    }
+
+    /** Toggle shuffle mode on / off. */
+    fun onToggleShuffle() {
+        viewModelScope.launch { playerRepository.toggleShuffle() }
+    }
+
+    /** Cycle repeat mode: OFF -> ALL -> ONE -> OFF. */
+    fun onCycleRepeatMode() {
+        viewModelScope.launch { playerRepository.cycleRepeatMode() }
+    }
+
+    /**
+     * Remove the track at [index] from the playback queue.
+     * The currently-playing track cannot be removed through this action.
+     */
+    fun onRemoveFromQueue(index: Int) {
+        if (index == _uiState.value.currentIndex) return
+        viewModelScope.launch { playerRepository.removeFromQueue(index) }
+    }
+
+    /**
+     * Move a track within the queue from position [from] to position [to].
+     */
+    fun onMoveInQueue(from: Int, to: Int) {
+        viewModelScope.launch { playerRepository.moveInQueue(from, to) }
+    }
+
+    /**
+     * Jump playback to the track at [index] in the queue.
+     */
+    fun onSkipToQueueIndex(index: Int) {
+        viewModelScope.launch { playerRepository.skipToQueueIndex(index) }
+    }
+
+    // ------------------------------------------------------------------
+    // Playlist Actions
+    // ------------------------------------------------------------------
+
+    /**
+     * Add the currently-playing track to an existing playlist.
+     *
+     * @param trackId    ID of the track to save.
+     * @param playlistId ID of the target playlist.
+     */
+    fun saveTrackToPlaylist(trackId: Long, playlistId: Long) {
+        viewModelScope.launch { musicRepository.addTrackToPlaylist(trackId, playlistId) }
+    }
+
+    /**
+     * Create a new playlist and immediately add the given track to it.
+     *
+     * @param name    Name for the new playlist.
+     * @param trackId ID of the track to save into the newly created playlist.
+     */
+    fun createPlaylistAndAddTrack(name: String, trackId: Long) {
+        viewModelScope.launch {
+            val playlistId = musicRepository.createPlaylist(name)
+            musicRepository.addTrackToPlaylist(trackId, playlistId)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Wrong-match flagging
+    // ------------------------------------------------------------------
+
+    /**
+     * Flag the currently-playing track as the wrong song. Surfaces it in
+     * the Failed Matches screen so the user can pick a replacement. No-op
+     * when nothing is playing. Emits a snackbar message so the user knows
+     * where to go next.
+     */
+    fun flagCurrentTrackAsWrongMatch() {
+        val track = _uiState.value.currentTrack ?: return
+        viewModelScope.launch {
+            musicRepository.setMatchFlagged(track.id, true)
+            _userMessages.tryEmit("Flagged. Find it in Sync \u2192 Failed Matches to pick a replacement.")
+        }
+    }
+
+    /**
+     * v0.9.18: upgrade the currently-playing track to FLAC if any
+     * lossless source can serve it. Fire-and-forget — emits a "looking"
+     * snackbar immediately, then a result snackbar when the resolve +
+     * download completes.
+     *
+     * No-op when nothing is playing or when the current track is already
+     * FLAC (UI hides the button in that case, but defensive guard here
+     * in case state changes mid-tap).
+     */
+    /**
+     * Toggle download state for the currently-playing track. Queues a
+     * download when not yet on disk; removes the file (keeping the row)
+     * when already downloaded. Streaming-mode users may never have
+     * downloaded the track being played — this is the in-the-moment
+     * shortcut to keep what's currently playing.
+     */
+    fun toggleDownloadForCurrentTrack() {
+        val track = _uiState.value.currentTrack ?: return
+        viewModelScope.launch {
+            if (track.isDownloaded) {
+                musicRepository.removeDownload(track.id)
+                _userMessages.tryEmit("Download removed.")
+            } else {
+                // Resolve a synthetic streaming-engine id to a real DB row
+                // before queuing — otherwise `getById` returns null and the
+                // queue insert silently no-ops while the toast still fires
+                // (issue #105).
+                val realId = runCatching { musicRepository.ensureTrackPersisted(track) }
+                    .getOrElse { e ->
+                        android.util.Log.w("NowPlayingViewModel", "ensureTrackPersisted failed", e)
+                        _userMessages.tryEmit("Couldn't queue download.")
+                        return@launch
+                    }
+                val queued = musicRepository.queueDownload(realId)
+                _userMessages.tryEmit(
+                    if (queued) "Queued for download."
+                    else "Couldn't queue download."
+                )
+            }
+        }
+    }
+
+    fun findInFlacForCurrentTrack() {
+        val track = _uiState.value.currentTrack ?: return
+        if (track.isFlac) return
+        viewModelScope.launch {
+            _userMessages.tryEmit("Looking for FLAC\u2026")
+            val result = losslessUpgrader.upgradeToLossless(track)
+            _userMessages.tryEmit(snackbarCopyFor(result))
+        }
+    }
+
+    /**
+     * Destroy the currently-playing track. Deletes the audio file + row;
+     * if [alsoBlock] is set, keeps the row as a blacklist tombstone so
+     * future syncs skip the identity forever.
+     *
+     * Skips to the next track BEFORE the delete so ExoPlayer doesn't
+     * error out mid-playback on a file that just disappeared under it.
+     * On the last track in the queue, skipNext will stop playback
+     * naturally — cleaner than racing the delete.
+     */
+    fun deleteCurrentTrack(alsoBlock: Boolean) {
+        val track = _uiState.value.currentTrack ?: return
+        viewModelScope.launch {
+            playerRepository.skipNext()
+            if (alsoBlock) {
+                musicRepository.blacklistTrack(track.id)
+                _userMessages.tryEmit("Deleted and blocked from future syncs.")
+            } else {
+                musicRepository.deleteTrack(track)
+                _userMessages.tryEmit("Deleted from your device.")
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // v0.9.36 — Lyrics sheet actions
+    // ------------------------------------------------------------------
+
+    /**
+     * Open the lyrics sheet for the currently-playing track. If the
+     * track has never had a fetch attempt (`lyricsFetchedAt == null`),
+     * also enqueue a priority [LyricsFetchWorker] so the sheet
+     * transitions from Loading → Synced/Plain/None without waiting on
+     * the post-download or backfill paths.
+     *
+     * Safe to call when nothing is playing — the sheet just opens
+     * empty and observes whatever the next track produces.
+     */
+    fun onShowLyrics() {
+        _lyricsSheetOpen.value = true
+        val track = _uiState.value.currentTrack ?: return
+        when {
+            // Library track with no fetch attempt yet — queue the worker, let
+            // the Room observation pick up the result.
+            track.id > 0L && track.lyricsFetchedAt == null -> enqueuePriorityFetch(track.id)
+            // Library track with prior attempt — Room observer already wired,
+            // nothing to do.
+            track.id > 0L -> Unit
+            // Streaming track (id == 0L) — no Room row to observe. Fetch via
+            // the source chain directly, render through the transient flow.
+            else -> fetchStreamingLyrics(track)
+        }
+    }
+
+    /** Close the lyrics sheet without affecting playback. */
+    fun onDismissLyrics() {
+        _lyricsSheetOpen.value = false
+    }
+
+    /**
+     * Retry the lyrics fetch for the currently-playing track. Re-enqueues
+     * with [ExistingWorkPolicy.REPLACE] so an in-flight (probably failing)
+     * attempt is cancelled in favour of a fresh one. No-op when nothing
+     * is playing or when the track has no valid id (search-preview rows).
+     */
+    fun onLyricsRetry() {
+        val track = _uiState.value.currentTrack ?: return
+        if (track.id > 0L) enqueuePriorityFetch(track.id)
+        else fetchStreamingLyrics(track)
+    }
+
+    /**
+     * Streaming-track lyrics path. Hits the source chain via
+     * [LyricsRepository.resolveTransient] (no Room write, no sidecar) and
+     * pushes the resulting [LyricsViewState] into [_streamingLyricsState].
+     * Re-entrant: calling on Retry resets to Loading then runs the chain
+     * fresh.
+     */
+    private fun fetchStreamingLyrics(track: Track) {
+        _streamingLyricsState.value = LyricsViewState.Loading
+        viewModelScope.launch {
+            val query = LyricsQuery(
+                trackId = 0L,                                    // unused in transient path
+                title = track.title,
+                artist = track.artist,
+                album = track.album.ifBlank { null },
+                albumArtist = track.albumArtist.ifBlank { null },
+                durationMs = track.durationMs.takeIf { it > 0 },
+                youtubeVideoId = track.youtubeId,
+            )
+            val result = runCatching { lyricsRepository.resolveTransient(query) }.getOrNull()
+            _streamingLyricsState.value = lyricsViewStateForResult(result)
+        }
+    }
+
+    /**
+     * Tap-to-seek on a synced lyric line. Routed through the same
+     * player-controller seek path that the progress bar uses
+     * ([onSeekTo]) so the seek is bounded by the current duration.
+     */
+    fun onLyricsLineSeek(timestampMs: Long) {
+        onSeekTo(timestampMs)
+    }
+
+    /**
+     * Enqueue a priority lyrics fetch for [trackId]. Unique-name keyed
+     * by `lyrics_priority_<trackId>` with REPLACE policy so opening the
+     * sheet always jumps the queue with a fresh expedited request.
+     *
+     * `OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST` keeps the
+     * worker valid in low-quota windows — it'll just run as a normal
+     * job instead of an expedited one. Matches the LyricsBackfillScheduler
+     * convention.
+     */
+    private fun enqueuePriorityFetch(trackId: Long) {
+        WorkManager.getInstance(appContext).enqueueUniqueWork(
+            "${LyricsFetchWorker.UNIQUE_PREFIX_PRIORITY}$trackId",
+            ExistingWorkPolicy.REPLACE,
+            OneTimeWorkRequestBuilder<LyricsFetchWorker>()
+                .setInputData(workDataOf(LyricsFetchWorker.KEY_TRACK_ID to trackId))
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build(),
+                )
+                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                .build(),
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // v0.9.13 — Heart / Like actions (Stash-only, standard toggle UX)
+    // ------------------------------------------------------------------
+
+    /**
+     * Heart toggle. Tap on an unliked track adds it to the local Stash
+     * Liked Songs playlist; tap on a liked track removes it. Pure
+     * local-DB operation — does NOT propagate to Spotify/YT Music.
+     *
+     * The Spotify auto-save scrobbler runs separately; un-liking
+     * locally never unsaves on Spotify (per v0.9.13 design — keeps
+     * the user's external account untouched).
+     *
+     * Heart-state visual: optimistic update writes the new
+     * stashLikedAt value to [_uiState.currentTrack] so the icon flips
+     * immediately. Room's observation eventually delivers the same
+     * value, so the two converge without a flicker.
+     */
+    fun onLikeTap() {
+        val track = _uiState.value.currentTrack ?: return
+        val wasLiked = track.stashLikedAt != null
+
+        // Optimistic UI: flip the state in our local map immediately.
+        // The combine() block in observePlayerStateLive merges this so
+        // the heart icon updates within one frame and stays updated.
+        // We use a temporary key for non-library tracks (id=0) using their videoId.
+        val trackKey = if (track.id == 0L) track.youtubeId.hashCode().toLong() else track.id
+        optimisticLikeState.update { it + (trackKey to !wasLiked) }
+
+        viewModelScope.launch {
+            runCatching {
+                // Handles all three id shapes: real Room PK, search-preview
+                // id=0 (legacy), and v0.9.30 streaming-engine synthetic
+                // `videoId.hashCode().toLong()`. Without this, streaming-only
+                // tracks (e.g. Liked Songs played from network with no local
+                // file) FK-violate at the cross-ref insert and surface as
+                // "Couldn't add to Liked Songs" (issue #105).
+                val finalTrackId = musicRepository.ensureTrackPersisted(track)
+
+                if (wasLiked) {
+                    stashLikedRepository.remove(finalTrackId)
+                } else {
+                    stashLikedRepository.add(finalTrackId)
+                }
+                // Once the DB write is confirmed, we can clear the optimistic
+                // override; Room's own emission will carry the truth.
+                optimisticLikeState.update { it - trackKey }
+            }.onFailure { e ->
+                android.util.Log.w("NowPlayingViewModel", "stash like toggle failed", e)
+                _userMessages.tryEmit(
+                    if (wasLiked) "Couldn't remove from Liked Songs"
+                    else "Couldn't add to Liked Songs"
+                )
+                // Roll back: clear the optimistic flip so UI reflects truth.
+                optimisticLikeState.update { it - trackKey }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Palette Color Extraction
+    // ------------------------------------------------------------------
+
+    fun onAlbumArtLoaded(bitmap: Bitmap?) {
+        if (bitmap == null) {
+            _uiState.update {
+                it.copy(
+                    dominantColor = Color(0xFF6750A4),
+                    vibrantColor = Color(0xFF8E24AA),
+                    mutedColor = Color(0xFF37474F),
+                    gradientColors = emptyList(),
+                )
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            val (dominant, vibrant, muted, gradientColors) = withContext(Dispatchers.Default) {
+                val palette = Palette.from(bitmap)
+                    .maximumColorCount(8)
+                    .resizeBitmapArea(100 * 100)
+                    .generate()
+                
+                // Try to get swatches
+                val swatches = palette.swatches.sortedByDescending { it.population }
+                val dominantSwatch = palette.dominantSwatch ?: swatches.firstOrNull()
+                val vibrantSwatch = palette.vibrantSwatch ?: dominantSwatch
+                val mutedSwatch = palette.mutedSwatch ?: dominantSwatch
+                
+                val domColor = dominantSwatch?.rgb ?: 0xFF6750A4.toInt()
+                val vibColor = vibrantSwatch?.rgb ?: 0xFF8E24AA.toInt()
+                val mutColor = mutedSwatch?.rgb ?: 0xFF37474F.toInt()
+
+                val extractedGradients = PlayerColorExtractor.extractGradientColors(palette, 0xFF000000.toInt())
+                
+                Tuple4(
+                    Color(domColor),
+                    Color(vibColor),
+                    Color(mutColor),
+                    extractedGradients
+                )
+            }
+            _uiState.update {
+                it.copy(
+                    dominantColor = dominant,
+                    vibrantColor = vibrant,
+                    mutedColor = muted,
+                    gradientColors = gradientColors,
+                )
+            }
+        }
+    }
+
+    /**
+     * Extracts a 3-color gradient from the palette, sorted by luminance (dark to light).
+     * Mimics Metrolist's PlayerColorExtractor.extractGradientColors.
+     */
+
+}
+
+// Simple helper class for returning 4 elements
+private data class Tuple4<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+
+/**
+ * Pure mapping from [UpgradeResult] to the snackbar string shown after
+ * a Now Playing "Find in FLAC" attempt. Top-level + `internal` so the
+ * test in this module can call it without instantiating the ViewModel.
+ */
+internal fun snackbarCopyFor(result: UpgradeResult): String = when (result) {
+    UpgradeResult.Upgraded -> "Upgraded to FLAC"
+    UpgradeResult.NoMatch -> "No lossless match found"
+    UpgradeResult.Error -> "Couldn't check lossless sources"
+}

@@ -1,0 +1,200 @@
+package com.stash.feature.library
+
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.stash.core.data.repository.MusicRepository
+import com.stash.core.media.BulkPlayAction
+import com.stash.core.media.PlayerRepository
+import com.stash.core.model.MusicSource
+import com.stash.core.model.PlaylistType
+import com.stash.core.model.Track
+import com.stash.core.ui.util.withSearchFilter
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+data class LikedSongsDetailUiState(
+    val title: String = "Liked Songs",
+    val tracks: List<Track> = emptyList(),
+    val isLoading: Boolean = true,
+    val currentlyPlayingTrackId: Long? = null,
+    val source: MusicSource? = null,
+    val searchQuery: String = "",
+    val showSearch: Boolean = false,
+)
+
+@OptIn(FlowPreview::class)
+@HiltViewModel
+class LikedSongsDetailViewModel @Inject constructor(
+    savedStateHandle: SavedStateHandle,
+    private val musicRepository: MusicRepository,
+    private val playerRepository: PlayerRepository,
+    private val streamingPreference: com.stash.core.data.prefs.StreamingPreference,
+) : ViewModel() {
+
+    private val sourceFilter: MusicSource? =
+        savedStateHandle.get<String>("source")?.let { MusicSource.valueOf(it) }
+
+    private val _searchQuery = MutableStateFlow("")
+    private val _showSearch = MutableStateFlow(false)
+
+    private val _tappedTrackId = MutableStateFlow<Long?>(null)
+    val tappedTrackId: StateFlow<Long?> = _tappedTrackId.asStateFlow()
+
+    private val _bulkPlayInFlight = MutableStateFlow<BulkPlayAction?>(null)
+    val bulkPlayInFlight: StateFlow<BulkPlayAction?> = _bulkPlayInFlight.asStateFlow()
+
+    fun onSearchQueryChanged(query: String) { _searchQuery.value = query }
+    fun clearSearch() { _searchQuery.value = "" }
+    fun toggleSearch() {
+        _showSearch.value = !_showSearch.value
+        if (!_showSearch.value) _searchQuery.value = ""
+    }
+
+    private val tracksFlow = musicRepository.getPlaylistsByType(PlaylistType.LIKED_SONGS)
+        .map { playlists ->
+            if (sourceFilter != null) playlists.filter { it.source == sourceFilter }
+            else playlists
+        }
+        .flatMapLatest { playlists ->
+            if (playlists.isEmpty()) {
+                flowOf(emptyList())
+            } else {
+                combine(playlists.map { musicRepository.getTracksByPlaylist(it.id) }) { arrays ->
+                    arrays.flatMap { it.toList() }.distinctBy { it.id }
+                }
+            }
+        }
+
+    val uiState: StateFlow<LikedSongsDetailUiState> = combine(
+        tracksFlow.withSearchFilter(_searchQuery),
+        playerRepository.playerState,
+        _searchQuery,
+        _showSearch,
+    ) { tracks, playerState, query, showSearch ->
+        val title = when (sourceFilter) {
+            MusicSource.SPOTIFY -> "Liked Songs \u2022 Spotify"
+            MusicSource.YOUTUBE -> "Liked Songs \u2022 YouTube"
+            else -> "Liked Songs"
+        }
+        LikedSongsDetailUiState(
+            title = title,
+            tracks = tracks,
+            isLoading = false,
+            currentlyPlayingTrackId = playerState.currentTrack?.id,
+            source = sourceFilter,
+            searchQuery = query,
+            showSearch = showSearch,
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = LikedSongsDetailUiState(),
+    )
+
+    fun playTrack(trackId: Long) {
+        viewModelScope.launch {
+            _tappedTrackId.value = trackId
+            try {
+                // Streaming mode: keep streamable tracks in the queue (resolved
+                // via Kennyy inside setQueue). Offline mode: filter to disk-only.
+                val streamingOn = streamingPreference.current()
+                val playable = if (streamingOn) {
+                    uiState.value.tracks
+                } else {
+                    uiState.value.tracks.filter { it.filePath != null }
+                }
+                if (playable.isEmpty()) return@launch
+                val index = playable.indexOfFirst { it.id == trackId }.coerceAtLeast(0)
+                playerRepository.setQueue(playable, index)
+            } finally {
+                _tappedTrackId.value = null
+            }
+        }
+    }
+
+    fun shuffleAll() {
+        viewModelScope.launch {
+            val streamingOn = streamingPreference.current()
+            val playable = if (streamingOn) {
+                uiState.value.tracks
+            } else {
+                uiState.value.tracks.filter { it.filePath != null }
+            }
+            if (playable.isEmpty()) return@launch
+            val shuffled = playable.shuffled()
+            _tappedTrackId.value = shuffled[0].id
+            _bulkPlayInFlight.value = BulkPlayAction.SHUFFLE_ALL
+            try {
+                playerRepository.setQueue(shuffled, 0)
+            } finally {
+                _tappedTrackId.value = null
+                _bulkPlayInFlight.compareAndSet(BulkPlayAction.SHUFFLE_ALL, null)
+            }
+        }
+    }
+
+    fun playAll() {
+        viewModelScope.launch {
+            val streamingOn = streamingPreference.current()
+            val playable = if (streamingOn) {
+                uiState.value.tracks
+            } else {
+                uiState.value.tracks.filter { it.filePath != null }
+            }
+            if (playable.isEmpty()) return@launch
+            _tappedTrackId.value = playable[0].id
+            _bulkPlayInFlight.value = BulkPlayAction.PLAY_ALL
+            try {
+                playerRepository.setQueue(playable, 0)
+            } finally {
+                _tappedTrackId.value = null
+                _bulkPlayInFlight.compareAndSet(BulkPlayAction.PLAY_ALL, null)
+            }
+        }
+    }
+
+    fun playNext(track: Track) {
+        viewModelScope.launch { playerRepository.addNext(track) }
+    }
+
+    fun addToQueue(track: Track) {
+        viewModelScope.launch { playerRepository.addToQueue(track) }
+    }
+
+    fun deleteTrack(track: Track) {
+        viewModelScope.launch { musicRepository.deleteTrack(track) }
+    }
+
+    fun queueDownload(trackId: Long) {
+        viewModelScope.launch { musicRepository.queueDownload(trackId) }
+    }
+
+    fun removeDownload(trackId: Long) {
+        viewModelScope.launch { musicRepository.removeDownload(trackId) }
+    }
+
+    val userPlaylists = musicRepository.getUserCreatedPlaylists()
+
+    fun saveTrackToPlaylist(trackId: Long, playlistId: Long) {
+        viewModelScope.launch { musicRepository.addTrackToPlaylist(trackId, playlistId) }
+    }
+
+    fun createPlaylistAndAddTrack(name: String, trackId: Long) {
+        viewModelScope.launch {
+            val id = musicRepository.createPlaylist(name)
+            musicRepository.addTrackToPlaylist(trackId, id)
+        }
+    }
+}
